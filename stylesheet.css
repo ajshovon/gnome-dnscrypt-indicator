@@ -1,0 +1,28 @@
+/* DNSCrypt Indicator GNOME Shell Stylesheet */
+
+.dnscrypt-status-active {
+    color: #2ec27e;
+    font-weight: bold;
+}
+
+.dnscrypt-status-inactive {
+    color: #e01b24;
+    font-weight: bold;
+}
+
+.dnscrypt-panel-latency {
+    font-size: 0.85em;
+    font-weight: 500;
+    margin-left: 4px;
+    margin-right: 2px;
+}
+
+.dnscrypt-subtitle {
+    font-size: 0.8em;
+    opacity: 0.7;
+}
+
+.dnscrypt-item-info {
+    font-size: 0.85em;
+    opacity: 0.85;
+}

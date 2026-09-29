@@ -1,0 +1,16 @@
+{
+  "uuid": "dnscrypt-indicator@local",
+  "name": "DNSCrypt Indicator",
+  "description": "Top-bar status indicator and quick-control menu for dnscrypt-proxy with Split-DNS domain rules, upstream resolvers, and latency benchmark.",
+  "settings-schema": "org.gnome.shell.extensions.dnscrypt-indicator",
+  "shell-version": [
+    "45",
+    "46",
+    "47",
+    "48",
+    "49",
+    "50"
+  ],
+  "version": 1,
+  "url": ""
+}

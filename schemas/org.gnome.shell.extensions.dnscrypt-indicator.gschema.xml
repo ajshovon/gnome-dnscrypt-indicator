@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist gettext-domain="dnscrypt-indicator">
+  <schema id="org.gnome.shell.extensions.dnscrypt-indicator" path="/org/gnome/shell/extensions/dnscrypt-indicator/">
+    <key name="show-latency-in-panel" type="b">
+      <default>false</default>
+      <summary>Show DNS resolution latency in panel</summary>
+      <description>Display resolution ping latency next to the icon in the top panel.</description>
+    </key>
+    <key name="refresh-interval" type="i">
+      <default>5</default>
+      <summary>Status check interval</summary>
+      <description>Frequency in seconds to poll dnscrypt-proxy status.</description>
+    </key>
+    <key name="icon-style" type="s">
+      <default>'shield'</default>
+      <summary>Panel icon style</summary>
+      <description>Icon choice: shield, network, or lock.</description>
+    </key>
+    <key name="config-dir" type="s">
+      <default>'/etc/dnscrypt-proxy'</default>
+      <summary>Configuration directory</summary>
+      <description>Directory containing dnscrypt-proxy.toml and forwarding-rules.txt.</description>
+    </key>
+  </schema>
+</schemalist>
