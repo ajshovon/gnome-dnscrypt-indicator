@@ -10,8 +10,12 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
 Gio._promisify(Gio.DBusConnection.prototype, 'call');
 Gio._promisify(Gio.File.prototype, 'load_contents_async');
+Gio._promisify(Gio.File.prototype, 'query_info_async');
+Gio._promisify(Gio.Subprocess.prototype, 'communicate_utf8_async');
 
 const SERVICE = 'dnscrypt-proxy.service';
+const HELPER = '/usr/local/libexec/dnscrypt-ui-helper';
+const APP_ID = 'io.github.shovon.DNSCryptUI.desktop';
 const SYSTEMD = 'org.freedesktop.systemd1';
 const RESOLVE1 = 'org.freedesktop.resolve1';
 const STUB_ADDRESSES = ['127.0.0.53', '127.0.0.54'];
@@ -83,6 +87,46 @@ function parseRules(text) {
             rules.push({ domain: parts[0], target: parts[1] });
     }
     return rules;
+}
+
+/** GNOME 50 deprecates Gio.DesktopAppInfo in favour of GioUnix; older GNOME only has the former. */
+async function desktopAppInfo(id) {
+    try {
+        const {default: GioUnix} = await import('gi://GioUnix');
+        if (GioUnix.DesktopAppInfo)
+            return GioUnix.DesktopAppInfo.new(id);
+    } catch (e) {
+        // GLib < 2.80 has no GioUnix typelib
+    }
+    return Gio.DesktopAppInfo.new(id);
+}
+
+/** DNSCrypt UI's privileged helper, only if installed root-owned and not writable by others. */
+async function helperInstalled(cancellable) {
+    try {
+        const info = await Gio.File.new_for_path(HELPER).query_info_async('unix::uid,unix::mode',
+            Gio.FileQueryInfoFlags.NONE, GLib.PRIORITY_DEFAULT, cancellable);
+        return info.get_attribute_uint32('unix::uid') === 0 &&
+            (info.get_attribute_uint32('unix::mode') & 0o022) === 0;
+    } catch (e) {
+        return false;
+    }
+}
+
+/** Runs `pkexec HELPER command`; GNOME Shell shows the authentication dialog. */
+async function runHelper(command, cancellable) {
+    const proc = Gio.Subprocess.new(['pkexec', HELPER, command],
+        Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
+    const [stdout, stderr] = await proc.communicate_utf8_async(null, cancellable);
+    const lines = (stdout ?? '').trim().split('\n');
+    try {
+        return JSON.parse(lines[lines.length - 1]);
+    } catch (e) {
+        const status = proc.get_exit_status();
+        if (status === 126 || status === 127)
+            return {ok: false, cancelled: true};
+        return {ok: false, message: (stderr ?? '').trim() || `pkexec exited with status ${status}`};
+    }
 }
 
 let fdAddFull = null;
@@ -186,6 +230,7 @@ class DNSCryptIndicator extends PanelMenu.Button {
         this._listenAddresses = ['127.0.0.1:53'];
         this._loopbackIndex = 1;
         this._updatingSwitch = false;
+        this._busy = false;
 
         this._buildPanelUI();
         this._buildMenu();
@@ -231,7 +276,7 @@ class DNSCryptIndicator extends PanelMenu.Button {
         this._switchItem = new PopupMenu.PopupSwitchMenuItem(_('Encrypted DNS'), false);
         this._switchItem.connect('toggled', (_item, state) => {
             if (!this._updatingSwitch)
-                this._unitAction(state ? 'StartUnit' : 'StopUnit');
+                this._toggleEncryptedDns(state);
         });
         this.menu.addMenuItem(this._switchItem);
 
@@ -248,7 +293,7 @@ class DNSCryptIndicator extends PanelMenu.Button {
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
-        this.menu.addAction(_('Restart Service'), () => this._unitAction('RestartUnit'));
+        this._restartItem = this.menu.addAction(_('Restart Service'), () => this._unitAction('RestartUnit'));
         this.menu.addAction(_('Open DNSCrypt UI'), () => this._launchApp());
         this.menu.addAction(_('Extension Settings'), () => this._extension.openPreferences());
 
@@ -266,6 +311,9 @@ class DNSCryptIndicator extends PanelMenu.Button {
         let icon = 'network-offline-symbolic';
         if (active && this._routing && !this._routing.protected) {
             icon = 'security-low-symbolic';
+        } else if (!active && this._routing?.protected) {
+            // System DNS points at the proxy, which is not running: nothing resolves
+            icon = 'network-error-symbolic';
         } else if (active) {
             icon = {
                 network: 'network-server-symbolic',
@@ -305,18 +353,53 @@ class DNSCryptIndicator extends PanelMenu.Button {
             this._switchItem.setToggleState(this._activeState === 'active');
             this._updatingSwitch = false;
         }
-        this._switchItem.setSensitive(this._loadState === 'loaded' && !transitioning);
+        this._switchItem.setSensitive(this._loadState === 'loaded' && !transitioning && !this._busy);
+        this._restartItem.setSensitive(['active', 'failed'].includes(this._activeState));
 
+        const active = this._activeState === 'active';
         const rl = this._routingItem.label;
         rl.remove_style_class_name('dnscrypt-status-warning');
         if (!this._routing) {
             rl.text = _('System DNS: checking…');
+        } else if (!active && this._routing.protected) {
+            rl.text = _('DNS is down: system DNS points at dnscrypt-proxy, which is not running');
+            rl.add_style_class_name('dnscrypt-status-warning');
+        } else if (!active) {
+            rl.text = _('Encrypted DNS is off. Using your network\'s DNS servers');
         } else if (this._routing.protected) {
             rl.text = _('System DNS goes through dnscrypt-proxy');
         } else {
             rl.text = `${_('DNS leaks:')} ${this._routing.problems[0]}`;
             rl.add_style_class_name('dnscrypt-status-warning');
         }
+    }
+
+    /**
+     * With DNSCrypt UI's helper installed, "off" first gives system DNS back to
+     * the network and then stops the proxy ("on" reverses it), so turning
+     * encrypted DNS off never leaves the computer without DNS.
+     */
+    async _toggleEncryptedDns(on) {
+        this._busy = true;
+        this._updateMenu();
+        try {
+            if (await helperInstalled(this._cancellable)) {
+                const result = await runHelper(on ? 'enable' : 'disable', this._cancellable);
+                if (!result.ok && !result.cancelled) {
+                    let message = result.message ?? '';
+                    if (message.startsWith('Unknown command'))
+                        message = _('The installed DNSCrypt UI helper is out of date. Run install.sh in the dns-crypt-ui folder.');
+                    Main.notify(_('Encrypted DNS'), message);
+                }
+            } else {
+                await this._unitAction(on ? 'StartUnit' : 'StopUnit');
+            }
+        } catch (e) {
+            this._logError('toggle', e);
+        } finally {
+            this._busy = false;
+        }
+        this._refreshUnit();
     }
 
     // Watching systemd and systemd-resolved
@@ -524,8 +607,8 @@ class DNSCryptIndicator extends PanelMenu.Button {
         this._updatePanel();
     }
 
-    _launchApp() {
-        const appInfo = Gio.DesktopAppInfo.new('io.github.shovon.DNSCryptUI.desktop');
+    async _launchApp() {
+        const appInfo = await desktopAppInfo(APP_ID);
         try {
             if (appInfo) {
                 appInfo.launch([], global.create_app_launch_context(0, -1));

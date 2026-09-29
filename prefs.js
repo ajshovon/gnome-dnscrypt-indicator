@@ -4,6 +4,18 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import { ExtensionPreferences, gettext as _ } from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
+/** GNOME 50 deprecates Gio.DesktopAppInfo in favour of GioUnix; older GNOME only has the former. */
+async function desktopAppInfo(id) {
+    try {
+        const {default: GioUnix} = await import('gi://GioUnix');
+        if (GioUnix.DesktopAppInfo)
+            return GioUnix.DesktopAppInfo.new(id);
+    } catch (e) {
+        // GLib < 2.80 has no GioUnix typelib
+    }
+    return Gio.DesktopAppInfo.new(id);
+}
+
 export default class DNSCryptIndicatorPreferences extends ExtensionPreferences {
     fillPreferencesWindow(window) {
         const settings = this.getSettings();
@@ -74,12 +86,13 @@ export default class DNSCryptIndicatorPreferences extends ExtensionPreferences {
         const configDirRow = new Adw.EntryRow({
             title: _('Config Directory'),
             text: settings.get_string('config-dir') || '/etc/dnscrypt-proxy',
+            show_apply_button: true,
         });
-        configDirRow.connect('changed', () => {
+        // Save on apply, not on every keystroke (each change re-reads the config)
+        configDirRow.connect('apply', () => {
             const val = configDirRow.get_text().trim();
-            if (val) {
+            if (val.startsWith('/'))
                 settings.set_string('config-dir', val);
-            }
         });
         pathGroup.add(configDirRow);
 
@@ -99,8 +112,8 @@ export default class DNSCryptIndicatorPreferences extends ExtensionPreferences {
             valign: Gtk.Align.CENTER,
             css_classes: ['suggested-action'],
         });
-        launchBtn.connect('clicked', () => {
-            const appInfo = Gio.DesktopAppInfo.new('io.github.shovon.DNSCryptUI.desktop');
+        launchBtn.connect('clicked', async () => {
+            const appInfo = await desktopAppInfo('io.github.shovon.DNSCryptUI.desktop');
             try {
                 if (appInfo) {
                     appInfo.launch([], null);
