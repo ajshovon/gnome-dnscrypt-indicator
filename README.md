@@ -1,66 +1,36 @@
 # DNSCrypt Indicator (GNOME Shell Extension)
 
-A dedicated, lightweight **GNOME Shell top-bar extension** for **`dnscrypt-proxy`** on GNOME 45, 46, 47, 48, 49, and 50+.
-
-It pairs with the standalone **DNSCrypt UI** application, giving you instant glanceability and quick toggles from the GNOME top bar.
-
----
+A top-bar indicator for **`dnscrypt-proxy`** on GNOME 45–50, companion to the **DNSCrypt UI** app.
 
 ## Features
 
-- **Top-Bar Status Icon**:
-  - Automatically updates icon color and shape based on `dnscrypt-proxy` service state (Active / Inactive).
-  - Customizable icon style: Shield, Network Server, or System Lock.
-- **Optional Panel Latency Display**:
-  - Glance at your resolution ping (e.g. `14ms`) directly in the top panel.
-- **Quick Service Toggle**:
-  - One-click switch to start or stop `dnscrypt-proxy.service` via PolicyKit.
-- **Instant DNS Ping / Benchmark**:
-  - Click "Test Latency (127.0.0.1:53)" to measure resolution latency to local proxy in real time.
-- **Split-DNS Domain Rules Submenu**:
-  - Inspect your active domain forwarding rules (YogaDNS split-DNS rules) directly from the panel.
-- **Active Resolvers Submenu**:
-  - See which encrypted upstream DoH or DNSCrypt resolvers are currently in use.
-- **Service Restart**:
-  - 1-click service restart from the menu.
-- **App Launcher**:
-  - Shortcut to launch the full standalone **DNSCrypt UI** (`dnscrypt-ui`) to edit domain rules and inspect live logs.
+- **Status that means something**: the icon shows whether dnscrypt-proxy is running *and* whether system DNS actually goes through it.
+  - Running and protected: shield, server, or lock icon (your choice).
+  - Running, but queries leak to other DNS servers: `security-low` warning icon, and the menu says where they leak.
+  - Stopped or not installed: offline icon.
+- **No polling**: service state comes from systemd and routing from systemd-resolved over D-Bus change signals. Nothing is spawned in the background.
+- **Start / stop / restart** through systemd's D-Bus API with the normal GNOME authentication dialog.
+- **Upstream latency**: sends an uncached query and measures the real encrypted round trip, not a cache hit. It can be shown in the panel (GNOME 46+).
+- **Domain rules and resolvers** submenus, read from the active configuration only (commented examples are ignored).
+- **Open DNSCrypt UI** for editing rules, resolvers, and fixing DNS leaks.
 
----
+## Install
 
-## Installation
-
-### 1. Install Extension
-From this directory, run:
 ```bash
 ./install.sh
 ```
 
-This compiles the GSettings schema and installs files to `~/.local/share/gnome-shell/extensions/dnscrypt-indicator@local`.
+On Wayland, log out and back in the first time, then:
 
-### 2. Activate in GNOME Shell
-- **On Fedora Wayland**: Log out and log back in (or restart your session) so GNOME Shell discovers the newly installed extension.
-- **On X11**: Press `Alt + F2`, type `r`, and press Enter.
-
-Then enable it via terminal:
 ```bash
 gnome-extensions enable dnscrypt-indicator@local
 ```
-Or open the **Extensions** / **Extension Manager** app and toggle on **DNSCrypt Indicator**.
 
----
+## Preferences
 
-## Extension Preferences
+`gnome-extensions prefs dnscrypt-indicator@local`, or **Extension Settings** in the menu:
 
-Open the extension preferences via:
-- The popup menu item **Extension Settings...**
-- Or from terminal:
-  ```bash
-  gnome-extensions prefs dnscrypt-indicator@local
-  ```
-
-Settings available:
-- **Show DNS Latency in Top Bar**: Display resolution milliseconds next to the panel icon.
-- **Panel Icon Style**: Choose between Security Shield, Network Server, or System Lock.
-- **Refresh Interval**: Customize polling frequency (2 to 60 seconds).
-- **Configuration Directory**: Path to `dnscrypt-proxy.toml` and `forwarding-rules.txt` (default `/etc/dnscrypt-proxy`).
+- **Show DNS latency in top bar**
+- **Latency refresh interval**: 10–600 seconds (only used for the panel latency)
+- **Panel icon style**: shield, server, or lock
+- **Config directory**: where `dnscrypt-proxy.toml` lives (default `/etc/dnscrypt-proxy`)

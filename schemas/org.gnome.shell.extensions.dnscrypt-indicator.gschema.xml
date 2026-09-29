@@ -4,12 +4,13 @@
     <key name="show-latency-in-panel" type="b">
       <default>false</default>
       <summary>Show DNS resolution latency in panel</summary>
-      <description>Display resolution ping latency next to the icon in the top panel.</description>
+      <description>Display the upstream round-trip time next to the icon in the top panel.</description>
     </key>
     <key name="refresh-interval" type="i">
-      <default>5</default>
-      <summary>Status check interval</summary>
-      <description>Frequency in seconds to poll dnscrypt-proxy status.</description>
+      <range min="10" max="600"/>
+      <default>30</default>
+      <summary>Latency refresh interval</summary>
+      <description>Seconds between panel latency measurements. Service state is not polled; it updates instantly from systemd.</description>
     </key>
     <key name="icon-style" type="s">
       <default>'shield'</default>

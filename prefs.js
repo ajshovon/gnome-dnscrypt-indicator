@@ -24,7 +24,7 @@ export default class DNSCryptIndicatorPreferences extends ExtensionPreferences {
         // Show Latency Switch
         const latencyRow = new Adw.SwitchRow({
             title: _('Show DNS Latency in Top Bar'),
-            subtitle: _('Displays resolution latency (e.g. 14ms) next to the icon in the panel'),
+            subtitle: _('Measures an uncached query through dnscrypt-proxy and shows the round trip next to the icon'),
         });
         panelGroup.add(latencyRow);
         settings.bind('show-latency-in-panel', latencyRow, 'active', Gio.SettingsBindFlags.DEFAULT);
@@ -33,7 +33,7 @@ export default class DNSCryptIndicatorPreferences extends ExtensionPreferences {
         const iconValues = ['shield', 'network', 'lock'];
         const iconRow = new Adw.ComboRow({
             title: _('Panel Icon Style'),
-            subtitle: _('Icon shape displayed in the panel when active'),
+            subtitle: _('Shown while DNS is protected. A warning icon replaces it when DNS leaks'),
             model: new Gtk.StringList({
                 strings: [
                     _('Security Shield (security-high-symbolic)'),
@@ -52,11 +52,11 @@ export default class DNSCryptIndicatorPreferences extends ExtensionPreferences {
 
         // Poll Interval
         const intervalRow = new Adw.SpinRow({
-            title: _('Refresh Interval (seconds)'),
-            subtitle: _('How often to check daemon status in the background'),
+            title: _('Latency Refresh Interval (seconds)'),
+            subtitle: _('Service state updates instantly; this only controls the panel latency'),
             adjustment: new Gtk.Adjustment({
-                lower: 2,
-                upper: 60,
+                lower: 10,
+                upper: 600,
                 step_increment: 1,
                 page_increment: 5,
             }),
@@ -100,23 +100,17 @@ export default class DNSCryptIndicatorPreferences extends ExtensionPreferences {
             css_classes: ['suggested-action'],
         });
         launchBtn.connect('clicked', () => {
+            const appInfo = Gio.DesktopAppInfo.new('io.github.shovon.DNSCryptUI.desktop');
             try {
-                const appInfo = Gio.DesktopAppInfo.new('io.github.shovon.DNSCryptUI.desktop');
                 if (appInfo) {
                     appInfo.launch([], null);
                     return;
                 }
-            } catch (e) {}
-
-            try {
-                const homeBin = `${GLib.get_home_dir()}/.local/bin/dnscrypt-ui`;
-                if (GLib.file_test(homeBin, GLib.FileTest.IS_EXECUTABLE)) {
-                    GLib.spawn_command_line_async(homeBin);
-                    return;
-                }
-                GLib.spawn_command_line_async('dnscrypt-ui');
-            } catch (err) {
-                console.error('Failed to launch dnscrypt-ui:', err);
+                const homeBin = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', 'dnscrypt-ui']);
+                const bin = GLib.file_test(homeBin, GLib.FileTest.IS_EXECUTABLE) ? homeBin : 'dnscrypt-ui';
+                Gio.Subprocess.new([bin], Gio.SubprocessFlags.NONE);
+            } catch (e) {
+                console.error('DNSCrypt Indicator: failed to launch dnscrypt-ui:', e.message);
             }
         });
         launchRow.add_suffix(launchBtn);

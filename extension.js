@@ -8,25 +8,160 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
-function runCommandAsync(argv) {
-    return new Promise((resolve, reject) => {
+Gio._promisify(Gio.DBusConnection.prototype, 'call');
+Gio._promisify(Gio.File.prototype, 'load_contents_async');
+
+const SERVICE = 'dnscrypt-proxy.service';
+const SYSTEMD = 'org.freedesktop.systemd1';
+const RESOLVE1 = 'org.freedesktop.resolve1';
+const STUB_ADDRESSES = ['127.0.0.53', '127.0.0.54'];
+const MIN_LATENCY_INTERVAL = 10;
+
+async function readText(path, cancellable) {
+    const [contents] = await Gio.File.new_for_path(path).load_contents_async(cancellable);
+    return new TextDecoder('utf-8').decode(contents);
+}
+
+async function busCall(bus, name, path, iface, method, params, cancellable, flags = Gio.DBusCallFlags.NONE) {
+    const reply = await bus.call(name, path, iface, method, params, null, flags, -1, cancellable);
+    return reply.recursiveUnpack();
+}
+
+async function getProperty(bus, name, path, iface, prop, cancellable) {
+    const [value] = await busCall(bus, name, path, 'org.freedesktop.DBus.Properties', 'Get',
+        new GLib.Variant('(ss)', [iface, prop]), cancellable);
+    return value;
+}
+
+/** Splits 'ip:port' / '[v6]:port' / 'ip' into [host, port]. */
+function splitHostPort(addr) {
+    addr = addr.trim();
+    let m = addr.match(/^\[(.+)\]:(\d+)$/);
+    if (m)
+        return [m[1], Number(m[2])];
+    m = addr.match(/^([^:]+):(\d+)$/);
+    if (m)
+        return [m[1], Number(m[2])];
+    return [addr, 53];
+}
+
+function probeTarget(listenAddresses) {
+    let [host, port] = splitHostPort(listenAddresses[0] || '127.0.0.1:53');
+    if (host === '0.0.0.0')
+        host = '127.0.0.1';
+    else if (host === '::')
+        host = '::1';
+    return [host, port];
+}
+
+/** Returns the lines of the TOML root table with comments removed. */
+function rootTomlLines(text) {
+    const lines = [];
+    for (const raw of text.split('\n')) {
+        const line = raw.replace(/#.*$/, '').trim();
+        if (/^\[[^\]'"]/.test(line))
+            break;
+        lines.push(line);
+    }
+    return lines.join('\n');
+}
+
+function tomlStringArray(rootText, key) {
+    // Strings may contain ']' (e.g. '[::1]:53'), so match whole string items
+    const m = rootText.match(new RegExp(`^${key}\\s*=\\s*\\[((?:\\s*(?:'[^']*'|"[^"]*")\\s*,?)*)\\s*\\]`, 'm'));
+    if (!m)
+        return null;
+    return [...m[1].matchAll(/'([^']*)'|"([^"]*)"/g)].map(x => x[1] ?? x[2]);
+}
+
+function parseRules(text) {
+    const rules = [];
+    for (const raw of text.split('\n')) {
+        const line = raw.replace(/#.*$/, '').trim();
+        const parts = line.split(/\s+/);
+        if (parts.length >= 2)
+            rules.push({ domain: parts[0], target: parts[1] });
+    }
+    return rules;
+}
+
+let fdAddFull = null;
+async function getFdAdd() {
+    if (!fdAddFull) {
         try {
-            const proc = Gio.Subprocess.new(
-                argv,
-                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
-            );
-            proc.communicate_utf8_async(null, null, (p, res) => {
-                try {
-                    const [, stdout, stderr] = p.communicate_utf8_finish(res);
-                    const exitCode = p.get_exit_status();
-                    resolve({ exitCode, stdout: (stdout || '').trim(), stderr: (stderr || '').trim() });
-                } catch (e) {
-                    reject(e);
-                }
-            });
+            fdAddFull = (await import('gi://GLibUnix')).default.fd_add_full;
         } catch (e) {
-            reject(e);
+            fdAddFull = GLib.unix_fd_add_full;
         }
+    }
+    return fdAddFull;
+}
+
+/**
+ * Sends an uncacheable query (random name) to dnscrypt-proxy and resolves with
+ * the round-trip time in ms, which includes the encrypted upstream hop.
+ */
+async function measureUpstreamLatency(host, port, registerCancel) {
+    if (typeof Gio.Socket.prototype.receive_bytes !== 'function')
+        throw new Error(_('Needs GNOME 46 or newer'));
+    const fdAdd = await getFdAdd();
+
+    const v6 = host.includes(':');
+    const sock = Gio.Socket.new(v6 ? Gio.SocketFamily.IPV6 : Gio.SocketFamily.IPV4,
+        Gio.SocketType.DATAGRAM, Gio.SocketProtocol.UDP);
+    sock.set_blocking(false);
+
+    const id = Math.floor(Math.random() * 0x10000);
+    const label = Math.random().toString(36).slice(2, 14);
+    const enc = new TextEncoder();
+    const qname = [];
+    for (const part of [label, 'example', 'com'])
+        qname.push(part.length, ...enc.encode(part));
+    const packet = new Uint8Array([id >> 8, id & 0xff, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, ...qname, 0, 0, 1, 0, 1]);
+
+    return new Promise((resolve, reject) => {
+        let fdId = 0;
+        let timeoutId = 0;
+        const t0 = GLib.get_monotonic_time();
+        const finish = (err, value) => {
+            if (fdId)
+                GLib.source_remove(fdId);
+            if (timeoutId)
+                GLib.source_remove(timeoutId);
+            fdId = timeoutId = 0;
+            registerCancel(null);
+            sock.close();
+            if (err)
+                reject(err);
+            else
+                resolve(value);
+        };
+        registerCancel(() => finish(new Error('cancelled')));
+
+        try {
+            sock.send_to(Gio.InetSocketAddress.new_from_string(host, port), packet, null);
+        } catch (e) {
+            finish(e);
+            return;
+        }
+        fdId = fdAdd(GLib.PRIORITY_DEFAULT, sock.get_fd(), GLib.IOCondition.IN, () => {
+            try {
+                const buf = sock.receive_bytes(4096, 0, null).toArray();
+                if (buf.length >= 12 && buf[0] === id >> 8 && buf[1] === (id & 0xff)) {
+                    fdId = 0;
+                    finish(null, (GLib.get_monotonic_time() - t0) / 1000);
+                    return GLib.SOURCE_REMOVE;
+                }
+            } catch (e) {
+                // spurious wakeup or ICMP error; keep waiting until the timeout
+            }
+            return GLib.SOURCE_CONTINUE;
+        });
+        timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 4000, () => {
+            timeoutId = 0;
+            finish(new Error(_('Query timed out')));
+            return GLib.SOURCE_REMOVE;
+        });
     });
 }
 
@@ -37,380 +172,387 @@ class DNSCryptIndicator extends PanelMenu.Button {
 
         this._extension = extension;
         this._settings = settings;
-        this._timerId = 0;
-        this._isActive = false;
+        this._bus = Gio.DBus.system;
+        this._cancellable = new Gio.Cancellable();
+        this._signalSubs = [];
+        this._latencyTimerId = 0;
+        this._cancelLatency = null;
+
+        this._unitPath = null;
+        this._loadState = 'unknown';
+        this._activeState = 'unknown';
+        this._routing = null; // {protected, problems}
         this._lastLatency = null;
+        this._listenAddresses = ['127.0.0.1:53'];
+        this._loopbackIndex = 1;
         this._updatingSwitch = false;
-        this._destroyed = false;
 
         this._buildPanelUI();
         this._buildMenu();
 
-        // Connect settings signals
         this._settingsSignals = [
-            this._settings.connect('changed::show-latency-in-panel', () => this._updatePanelLabel()),
-            this._settings.connect('changed::icon-style', () => this._updatePanelIcon()),
-            this._settings.connect('changed::refresh-interval', () => this._restartTimer()),
+            this._settings.connect('changed::show-latency-in-panel', () => this._restartLatencyTimer()),
+            this._settings.connect('changed::refresh-interval', () => this._restartLatencyTimer()),
+            this._settings.connect('changed::icon-style', () => this._updatePanel()),
+            this._settings.connect('changed::config-dir', () => this._loadConfig()),
         ];
 
-        // Start background polling and load config
-        this._checkStatus();
-        this._loadConfig();
-        this._restartTimer();
+        this._setup().catch(e => this._logError('setup', e));
     }
+
+    _logError(what, e) {
+        if (!(e instanceof GLib.Error && e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED)))
+            console.warn(`DNSCrypt Indicator: ${what}: ${e.message}`);
+    }
+
+    // UI
 
     _buildPanelUI() {
-        this._panelBox = new St.BoxLayout({
-            style_class: 'panel-status-indicators-box',
-            reactive: true,
-        });
-
-        this._icon = new St.Icon({
-            style_class: 'system-status-icon',
-            icon_name: this._getIconName(false),
-        });
-        this._panelBox.add_child(this._icon);
-
+        const box = new St.BoxLayout({ style_class: 'panel-status-indicators-box' });
+        this._icon = new St.Icon({ style_class: 'system-status-icon', icon_name: 'network-offline-symbolic' });
+        box.add_child(this._icon);
         this._latencyLabel = new St.Label({
             style_class: 'dnscrypt-panel-latency',
-            text: '',
             y_align: Clutter.ActorAlign.CENTER,
+            visible: false,
         });
-        this._panelBox.add_child(this._latencyLabel);
-        this._latencyLabel.visible = false;
-
-        this.add_child(this._panelBox);
-    }
-
-    _getIconName(active) {
-        const style = this._settings.get_string('icon-style') || 'shield';
-        if (!active) {
-            return 'network-offline-symbolic';
-        }
-        switch (style) {
-            case 'network':
-                return 'network-server-symbolic';
-            case 'lock':
-                return 'channel-secure-symbolic';
-            case 'shield':
-            default:
-                return 'security-high-symbolic';
-        }
-    }
-
-    _updatePanelIcon() {
-        this._icon.icon_name = this._getIconName(this._isActive);
-    }
-
-    _updatePanelLabel() {
-        const showLatency = this._settings.get_boolean('show-latency-in-panel');
-        if (showLatency && this._isActive && this._lastLatency !== null) {
-            this._latencyLabel.text = `${this._lastLatency}ms`;
-            this._latencyLabel.visible = true;
-        } else {
-            this._latencyLabel.visible = false;
-        }
+        box.add_child(this._latencyLabel);
+        this.add_child(box);
     }
 
     _buildMenu() {
-        // 1. Header / Status item
-        this._statusItem = new PopupMenu.PopupMenuItem(_('DNSCrypt-Proxy: Checking...'), {
-            reactive: false,
-        });
-        this._statusItem.label.add_style_class_name('dnscrypt-status-inactive');
+        this._statusItem = new PopupMenu.PopupMenuItem(_('dnscrypt-proxy: checking…'), { reactive: false });
         this.menu.addMenuItem(this._statusItem);
 
-        // 2. Service Switch
+        this._routingItem = new PopupMenu.PopupMenuItem(_('System DNS: checking…'), { reactive: false });
+        this._routingItem.label.clutter_text.line_wrap = true;
+        this.menu.addMenuItem(this._routingItem);
+
         this._switchItem = new PopupMenu.PopupSwitchMenuItem(_('Encrypted DNS'), false);
-        this._switchItem.connect('toggled', (item, state) => {
-            if (this._updatingSwitch) {
-                return;
-            }
-            this._onServiceToggled(state);
+        this._switchItem.connect('toggled', (_item, state) => {
+            if (!this._updatingSwitch)
+                this._unitAction(state ? 'StartUnit' : 'StopUnit');
         });
         this.menu.addMenuItem(this._switchItem);
 
-        // 3. DNS Ping / Latency test
-        this._pingItem = new PopupMenu.PopupMenuItem(_('Test Latency (127.0.0.1:53)'));
-        this._pingItem.connect('activate', () => {
-            this._measureLatency(true);
-        });
+        this._pingItem = new PopupMenu.PopupMenuItem(_('Test upstream latency'));
+        this._pingItem.connect('activate', () => this._measureLatency(true));
         this.menu.addMenuItem(this._pingItem);
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
-        // 4. Split-DNS Domain Rules Submenu
-        this._rulesSubMenu = new PopupMenu.PopupSubMenuMenuItem(_('Split-DNS Rules (0)'));
+        this._rulesSubMenu = new PopupMenu.PopupSubMenuMenuItem(_('Domain rules'));
         this.menu.addMenuItem(this._rulesSubMenu);
-
-        // 5. Upstream Resolvers Submenu
-        this._resolversSubMenu = new PopupMenu.PopupSubMenuMenuItem(_('Upstream Resolvers (0)'));
+        this._resolversSubMenu = new PopupMenu.PopupSubMenuMenuItem(_('Upstream resolvers'));
         this.menu.addMenuItem(this._resolversSubMenu);
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
-        // 6. Action items
-        const restartItem = new PopupMenu.PopupMenuItem(_('Restart Service'));
-        restartItem.connect('activate', () => {
-            this._restartService();
-        });
-        this.menu.addMenuItem(restartItem);
+        this.menu.addAction(_('Restart Service'), () => this._unitAction('RestartUnit'));
+        this.menu.addAction(_('Open DNSCrypt UI'), () => this._launchApp());
+        this.menu.addAction(_('Extension Settings'), () => this._extension.openPreferences());
 
-        const openUiItem = new PopupMenu.PopupMenuItem(_('Open DNSCrypt UI...'));
-        openUiItem.connect('activate', () => {
-            this._launchApp();
-        });
-        this.menu.addMenuItem(openUiItem);
-
-        const settingsItem = new PopupMenu.PopupMenuItem(_('Extension Settings...'));
-        settingsItem.connect('activate', () => {
-            this._extension.openPreferences();
-        });
-        this.menu.addMenuItem(settingsItem);
-
-        // Reload config on menu open
-        this.menu.connect('open-state-changed', (menu, isOpen) => {
+        this.menu.connect('open-state-changed', (_menu, isOpen) => {
             if (isOpen) {
-                this._checkStatus();
+                this._refreshUnit();
+                this._refreshRouting();
                 this._loadConfig();
             }
         });
     }
 
-    async _checkStatus() {
-        try {
-            const { stdout } = await runCommandAsync(['systemctl', 'is-active', 'dnscrypt-proxy']);
-            if (this._destroyed) return;
+    _updatePanel() {
+        const active = this._activeState === 'active';
+        let icon = 'network-offline-symbolic';
+        if (active && this._routing && !this._routing.protected) {
+            icon = 'security-low-symbolic';
+        } else if (active) {
+            icon = {
+                network: 'network-server-symbolic',
+                lock: 'channel-secure-symbolic',
+            }[this._settings.get_string('icon-style')] ?? 'security-high-symbolic';
+        }
+        this._icon.icon_name = icon;
 
-            const active = stdout === 'active';
-            this._isActive = active;
+        const showLatency = this._settings.get_boolean('show-latency-in-panel');
+        this._latencyLabel.visible = showLatency && active && this._lastLatency !== null;
+        if (this._latencyLabel.visible)
+            this._latencyLabel.text = _('%d ms').replace('%d', Math.round(this._lastLatency));
+    }
 
-            this._updatePanelIcon();
+    _updateMenu() {
+        const label = this._statusItem.label;
+        label.remove_style_class_name('dnscrypt-status-active');
+        label.remove_style_class_name('dnscrypt-status-inactive');
+        if (this._loadState !== 'loaded') {
+            label.text = this._loadState === 'unknown'
+                ? _('dnscrypt-proxy: checking…')
+                : _('dnscrypt-proxy is not installed');
+        } else {
+            label.text = {
+                active: _('dnscrypt-proxy is running'),
+                activating: _('dnscrypt-proxy is starting…'),
+                deactivating: _('dnscrypt-proxy is stopping…'),
+                reloading: _('dnscrypt-proxy is reloading…'),
+                failed: _('dnscrypt-proxy failed'),
+            }[this._activeState] ?? _('dnscrypt-proxy is stopped');
+            label.add_style_class_name(this._activeState === 'active' ? 'dnscrypt-status-active' : 'dnscrypt-status-inactive');
+        }
 
+        const transitioning = ['activating', 'deactivating', 'reloading'].includes(this._activeState);
+        if (!transitioning) {
             this._updatingSwitch = true;
-            try {
-                if (active) {
-                    this._statusItem.label.text = _('DNSCrypt-Proxy: Active (Running)');
-                    this._statusItem.label.remove_style_class_name('dnscrypt-status-inactive');
-                    this._statusItem.label.add_style_class_name('dnscrypt-status-active');
-                    this._switchItem.setToggleState(true);
+            this._switchItem.setToggleState(this._activeState === 'active');
+            this._updatingSwitch = false;
+        }
+        this._switchItem.setSensitive(this._loadState === 'loaded' && !transitioning);
 
-                    // Measure latency if panel display is enabled
-                    if (this._settings.get_boolean('show-latency-in-panel')) {
-                        this._measureLatency(false);
-                    }
-                } else {
-                    this._statusItem.label.text = _('DNSCrypt-Proxy: Inactive (Stopped)');
-                    this._statusItem.label.remove_style_class_name('dnscrypt-status-active');
-                    this._statusItem.label.add_style_class_name('dnscrypt-status-inactive');
-                    this._switchItem.setToggleState(false);
-                    this._lastLatency = null;
-                    this._updatePanelLabel();
-                }
-            } finally {
-                this._updatingSwitch = false;
-            }
-        } catch (e) {
-            if (this._destroyed) return;
-            this._isActive = false;
-            this._updatePanelIcon();
-            this._statusItem.label.text = _('DNSCrypt-Proxy: Not Installed / Error');
-            this._updatingSwitch = true;
-            try {
-                this._switchItem.setToggleState(false);
-            } finally {
-                this._updatingSwitch = false;
-            }
+        const rl = this._routingItem.label;
+        rl.remove_style_class_name('dnscrypt-status-warning');
+        if (!this._routing) {
+            rl.text = _('System DNS: checking…');
+        } else if (this._routing.protected) {
+            rl.text = _('System DNS goes through dnscrypt-proxy');
+        } else {
+            rl.text = `${_('DNS leaks:')} ${this._routing.problems[0]}`;
+            rl.add_style_class_name('dnscrypt-status-warning');
         }
     }
 
-    async _onServiceToggled(enable) {
-        const action = enable ? 'start' : 'stop';
+    // Watching systemd and systemd-resolved
+
+    async _setup() {
         try {
-            const { exitCode, stderr } = await runCommandAsync(['pkexec', 'systemctl', action, 'dnscrypt-proxy']);
-            if (this._destroyed) return;
-            if (exitCode !== 0) {
-                console.error(`DNSCrypt Indicator: pkexec ${action} failed (code ${exitCode}): ${stderr}`);
-            }
-            await this._checkStatus();
+            const idx = await readText('/sys/class/net/lo/ifindex', this._cancellable);
+            this._loopbackIndex = Number(idx.trim()) || 1;
         } catch (e) {
-            if (this._destroyed) return;
-            console.error(`DNSCrypt Indicator: Failed to ${action} service:`, e);
-            await this._checkStatus();
+            // keep the default
         }
+
+        // systemd only emits PropertiesChanged when some client subscribed
+        busCall(this._bus, SYSTEMD, '/org/freedesktop/systemd1', `${SYSTEMD}.Manager`, 'Subscribe',
+            null, this._cancellable).catch(e => this._logError('Subscribe', e));
+
+        [this._unitPath] = await busCall(this._bus, SYSTEMD, '/org/freedesktop/systemd1',
+            `${SYSTEMD}.Manager`, 'LoadUnit', new GLib.Variant('(s)', [SERVICE]), this._cancellable);
+
+        this._signalSubs.push(this._bus.signal_subscribe(SYSTEMD, 'org.freedesktop.DBus.Properties',
+            'PropertiesChanged', this._unitPath, `${SYSTEMD}.Unit`, Gio.DBusSignalFlags.NONE,
+            () => this._refreshUnit()));
+        this._signalSubs.push(this._bus.signal_subscribe(RESOLVE1, 'org.freedesktop.DBus.Properties',
+            'PropertiesChanged', '/org/freedesktop/resolve1', null, Gio.DBusSignalFlags.NONE,
+            () => this._refreshRouting()));
+
+        await this._loadConfig();
+        await this._refreshUnit();
     }
 
-    async _restartService() {
+    async _refreshUnit() {
+        if (!this._unitPath)
+            return;
         try {
-            const { exitCode, stderr } = await runCommandAsync(['pkexec', 'systemctl', 'restart', 'dnscrypt-proxy']);
-            if (this._destroyed) return;
-            if (exitCode === 0) {
-                Main.notify(_('DNSCrypt-Proxy'), _('Service restarted successfully.'));
-            } else {
-                console.error(`DNSCrypt Indicator: restart failed (code ${exitCode}): ${stderr}`);
-                Main.notify(_('DNSCrypt-Proxy'), _('Failed to restart service.'));
-            }
-            await this._checkStatus();
-        } catch (e) {
-            if (this._destroyed) return;
-            console.error('DNSCrypt Indicator: Failed to restart service:', e);
-            Main.notify(_('DNSCrypt-Proxy'), _('Failed to restart service.'));
-        }
-    }
-
-    async _measureLatency(showNotification = false) {
-        try {
-            const pyScript =
-                "import socket, time; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); " +
-                "s.settimeout(1.5); t=time.perf_counter(); " +
-                "s.sendto(b'\\x12\\x34\\x01\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x0acloudflare\\x03com\\x00\\x00\\x01\\x00\\x01', ('127.0.0.1', 53)); " +
-                "s.recvfrom(512); print(f'{(time.perf_counter()-t)*1000:.1f}')";
-
-            const { exitCode, stdout } = await runCommandAsync(['python3', '-c', pyScript]);
-            if (this._destroyed) return;
-
-            if (exitCode === 0 && stdout) {
-                const ms = parseFloat(stdout);
-                this._lastLatency = ms;
-                this._pingItem.label.text = _(`Ping: ${ms} ms (127.0.0.1:53)`);
-                this._updatePanelLabel();
-                if (showNotification) {
-                    Main.notify(_('DNS Latency Test'), _(`Resolved cloudflare.com in ${ms} ms via 127.0.0.1:53`));
-                }
-            } else {
-                this._pingItem.label.text = _('Ping: Query timed out');
+            const [props] = await busCall(this._bus, SYSTEMD, this._unitPath, 'org.freedesktop.DBus.Properties',
+                'GetAll', new GLib.Variant('(s)', [`${SYSTEMD}.Unit`]), this._cancellable);
+            const wasActive = this._activeState === 'active';
+            this._loadState = props.LoadState;
+            this._activeState = props.ActiveState;
+            if (!wasActive && this._activeState === 'active')
+                this._restartLatencyTimer();
+            if (this._activeState !== 'active')
                 this._lastLatency = null;
-                this._updatePanelLabel();
-            }
         } catch (e) {
-            if (this._destroyed) return;
-            this._pingItem.label.text = _('Ping: Resolution error');
-            this._lastLatency = null;
-            this._updatePanelLabel();
+            this._logError('unit state', e);
         }
+        this._updateMenu();
+        this._updatePanel();
+        this._refreshRouting();
     }
+
+    async _refreshRouting() {
+        try {
+            this._routing = await this._checkRouting();
+        } catch (e) {
+            this._logError('routing', e);
+            this._routing = null;
+        }
+        this._updateMenu();
+        this._updatePanel();
+    }
+
+    /** Mirrors ServiceManager.check_routing() in DNSCrypt UI. */
+    async _checkRouting() {
+        const problems = [];
+        const [proxyHost, proxyPort] = probeTarget(this._listenAddresses);
+        const listenHosts = this._listenAddresses.map(a => splitHostPort(a)[0]);
+
+        const text = await readText('/etc/resolv.conf', this._cancellable);
+        const nameservers = text.split('\n')
+            .map(l => l.trim().split(/\s+/))
+            .filter(p => p[0] === 'nameserver' && p[1])
+            .map(p => p[1]);
+
+        for (const ns of nameservers) {
+            if (STUB_ADDRESSES.includes(ns) || (listenHosts.includes(ns) && proxyPort === 53))
+                continue;
+            problems.push(_('resolv.conf sends queries to %s').replace('%s', ns));
+        }
+
+        if (nameservers.some(ns => STUB_ADDRESSES.includes(ns))) {
+            const servers = await getProperty(this._bus, RESOLVE1, '/org/freedesktop/resolve1',
+                `${RESOLVE1}.Manager`, 'DNSEx', this._cancellable);
+            let globalOk = false;
+            const links = new Map();
+            for (const [ifindex, family, raw, port] of servers) {
+                const ip = Gio.InetAddress.new_from_bytes(raw, family === 10 ? Gio.SocketFamily.IPV6 : Gio.SocketFamily.IPV4).to_string();
+                if (ifindex === 0 || ifindex === this._loopbackIndex) {
+                    const proxyIp = Gio.InetAddress.new_from_string(proxyHost)?.to_string();
+                    if (ip === proxyIp && (port || 53) === proxyPort)
+                        globalOk = true;
+                } else {
+                    links.set(ifindex, [...links.get(ifindex) ?? [], ip]);
+                }
+            }
+            if (!globalOk)
+                problems.push(_('systemd-resolved does not use dnscrypt-proxy'));
+
+            for (const [ifindex, addrs] of links) {
+                const [linkPath] = await busCall(this._bus, RESOLVE1, '/org/freedesktop/resolve1',
+                    `${RESOLVE1}.Manager`, 'GetLink', new GLib.Variant('(i)', [ifindex]), this._cancellable);
+                const defaultRoute = await getProperty(this._bus, RESOLVE1, linkPath,
+                    `${RESOLVE1}.Link`, 'DefaultRoute', this._cancellable);
+                if (defaultRoute)
+                    problems.push(_('a network also uses %s').replace('%s', addrs.join(', ')));
+            }
+        }
+        return { protected: problems.length === 0, problems };
+    }
+
+    async _unitAction(method) {
+        try {
+            await busCall(this._bus, SYSTEMD, '/org/freedesktop/systemd1', `${SYSTEMD}.Manager`, method,
+                new GLib.Variant('(ss)', [SERVICE, 'replace']), this._cancellable,
+                Gio.DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION);
+        } catch (e) {
+            this._logError(method, e);
+            if (!(e instanceof GLib.Error && e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED)))
+                Main.notify(_('dnscrypt-proxy'), _('Could not change the service: %s').replace('%s', e.message));
+        }
+        this._refreshUnit();
+    }
+
+    // Configuration
 
     async _loadConfig() {
         const configDir = this._settings.get_string('config-dir') || '/etc/dnscrypt-proxy';
-
-        // 1. Read forwarding-rules.txt
-        const rulesPath = `${configDir}/forwarding-rules.txt`;
+        let root = '';
         try {
-            const file = Gio.File.new_for_path(rulesPath);
-            const [success, contents] = file.load_contents(null);
-            if (success) {
-                const text = new TextDecoder('utf-8').decode(contents);
-                const rules = [];
-                for (const line of text.split('\n')) {
-                    const l = line.trim();
-                    if (!l || l.startsWith('#')) continue;
-                    const parts = l.split(/\s+/);
-                    if (parts.length >= 2) {
-                        rules.push({ domain: parts[0], target: parts[1] });
-                    }
-                }
-                this._rulesSubMenu.label.text = _(`Split-DNS Rules (${rules.length})`);
-                this._rulesSubMenu.menu.removeAll();
-                if (rules.length === 0) {
-                    this._rulesSubMenu.menu.addMenuItem(new PopupMenu.PopupMenuItem(_('No active rules'), { reactive: false }));
-                } else {
-                    for (const r of rules.slice(0, 10)) {
-                        const item = new PopupMenu.PopupMenuItem(`${r.domain} → ${r.target}`, { reactive: false });
-                        this._rulesSubMenu.menu.addMenuItem(item);
-                    }
-                    if (rules.length > 10) {
-                        this._rulesSubMenu.menu.addMenuItem(new PopupMenu.PopupMenuItem(_(`... and ${rules.length - 10} more`), { reactive: false }));
-                    }
-                }
-            }
+            root = rootTomlLines(await readText(`${configDir}/dnscrypt-proxy.toml`, this._cancellable));
         } catch (e) {
-            console.debug('DNSCrypt Indicator: Could not read forwarding-rules.txt:', e.message);
-            this._rulesSubMenu.label.text = _('Split-DNS Rules (0)');
+            this._logError('reading dnscrypt-proxy.toml', e);
         }
 
-        // 2. Read dnscrypt-proxy.toml for server_names
-        const tomlPath = `${configDir}/dnscrypt-proxy.toml`;
-        try {
-            const file = Gio.File.new_for_path(tomlPath);
-            const [success, contents] = file.load_contents(null);
-            if (success) {
-                const text = new TextDecoder('utf-8').decode(contents);
-                const match = text.match(/server_names\s*=\s*\[(.*?)\]/s);
-                const servers = [];
-                if (match && match[1]) {
-                    const raw = match[1];
-                    const items = raw.match(/['"](.*?)['"]/g) || [];
-                    for (const it of items) {
-                        servers.push(it.replace(/['"]/g, ''));
-                    }
-                }
-                this._resolversSubMenu.label.text = _(`Upstream Resolvers (${servers.length})`);
-                this._resolversSubMenu.menu.removeAll();
-                if (servers.length === 0) {
-                    this._resolversSubMenu.menu.addMenuItem(new PopupMenu.PopupMenuItem(_('Automatic / All resolvers'), { reactive: false }));
-                } else {
-                    for (const s of servers) {
-                        this._resolversSubMenu.menu.addMenuItem(new PopupMenu.PopupMenuItem(`• ${s}`, { reactive: false }));
-                    }
-                }
+        this._listenAddresses = tomlStringArray(root, 'listen_addresses') ?? ['127.0.0.1:53'];
+        const servers = tomlStringArray(root, 'server_names') ?? [];
+        this._resolversSubMenu.label.text = _('Upstream resolvers (%d)').replace('%d', servers.length);
+        this._resolversSubMenu.menu.removeAll();
+        if (servers.length === 0)
+            this._resolversSubMenu.menu.addMenuItem(new PopupMenu.PopupMenuItem(_('Automatic'), { reactive: false }));
+        for (const s of servers)
+            this._resolversSubMenu.menu.addMenuItem(new PopupMenu.PopupMenuItem(s, { reactive: false }));
+
+        const rulesMatch = root.match(/^forwarding_rules\s*=\s*['"]([^'"]+)['"]/m);
+        let rules = [];
+        if (rulesMatch) {
+            const file = rulesMatch[1].startsWith('/') ? rulesMatch[1] : `${configDir}/${rulesMatch[1]}`;
+            try {
+                rules = parseRules(await readText(file, this._cancellable));
+            } catch (e) {
+                this._logError('reading forwarding rules', e);
             }
-        } catch (e) {
-            this._resolversSubMenu.label.text = _('Upstream Resolvers (0)');
+        }
+        this._rulesSubMenu.label.text = _('Domain rules (%d)').replace('%d', rules.length);
+        this._rulesSubMenu.menu.removeAll();
+        if (rules.length === 0)
+            this._rulesSubMenu.menu.addMenuItem(new PopupMenu.PopupMenuItem(_('No active rules'), { reactive: false }));
+        for (const r of rules.slice(0, 10))
+            this._rulesSubMenu.menu.addMenuItem(new PopupMenu.PopupMenuItem(`${r.domain} → ${r.target}`, { reactive: false }));
+        if (rules.length > 10) {
+            this._rulesSubMenu.menu.addMenuItem(new PopupMenu.PopupMenuItem(
+                _('…and %d more').replace('%d', rules.length - 10), { reactive: false }));
         }
     }
 
-    _restartTimer() {
-        if (this._timerId) {
-            GLib.source_remove(this._timerId);
-            this._timerId = 0;
-        }
+    // Latency
 
-        const interval = Math.max(2, this._settings.get_int('refresh-interval') || 5);
-        this._timerId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, interval, () => {
-            this._checkStatus();
+    _restartLatencyTimer() {
+        if (this._latencyTimerId) {
+            GLib.source_remove(this._latencyTimerId);
+            this._latencyTimerId = 0;
+        }
+        if (!this._settings.get_boolean('show-latency-in-panel')) {
+            this._lastLatency = null;
+            this._updatePanel();
+            return;
+        }
+        const interval = Math.max(MIN_LATENCY_INTERVAL, this._settings.get_int('refresh-interval'));
+        this._measureLatency(false);
+        this._latencyTimerId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, interval, () => {
+            if (this._activeState === 'active')
+                this._measureLatency(false);
             return GLib.SOURCE_CONTINUE;
         });
     }
 
-    _launchApp() {
+    async _measureLatency(notify) {
+        if (this._activeState !== 'active' || this._cancelLatency)
+            return;
+        const [host, port] = probeTarget(this._listenAddresses);
         try {
-            const appInfo = Gio.DesktopAppInfo.new('io.github.shovon.DNSCryptUI.desktop');
-            if (appInfo) {
-                appInfo.launch([], null);
-                return;
-            }
+            const ms = await measureUpstreamLatency(host, port, cancel => {
+                this._cancelLatency = cancel;
+            });
+            this._lastLatency = ms;
+            this._pingItem.label.text = _('Upstream latency: %s ms').replace('%s', ms.toFixed(1));
+            if (notify)
+                Main.notify(_('DNS latency'), _('Uncached query answered in %s ms').replace('%s', ms.toFixed(1)));
         } catch (e) {
-            // fallback below
+            if (e.message === 'cancelled')
+                return;
+            this._lastLatency = null;
+            this._pingItem.label.text = _('Latency test failed: %s').replace('%s', e.message);
         }
+        this._updatePanel();
+    }
 
+    _launchApp() {
+        const appInfo = Gio.DesktopAppInfo.new('io.github.shovon.DNSCryptUI.desktop');
         try {
-            const homeBin = `${GLib.get_home_dir()}/.local/bin/dnscrypt-ui`;
-            if (GLib.file_test(homeBin, GLib.FileTest.IS_EXECUTABLE)) {
-                GLib.spawn_command_line_async(homeBin);
+            if (appInfo) {
+                appInfo.launch([], global.create_app_launch_context(0, -1));
                 return;
             }
-            GLib.spawn_command_line_async('dnscrypt-ui');
+            const homeBin = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', 'dnscrypt-ui']);
+            const bin = GLib.file_test(homeBin, GLib.FileTest.IS_EXECUTABLE) ? homeBin : 'dnscrypt-ui';
+            Gio.Subprocess.new([bin], Gio.SubprocessFlags.NONE);
         } catch (e) {
-            console.error('DNSCrypt Indicator: Failed to launch dnscrypt-ui:', e);
-            Main.notify(_('DNSCrypt Indicator'), _('Could not launch dnscrypt-ui. Ensure it is in PATH.'));
+            this._logError('launch', e);
+            Main.notify(_('DNSCrypt Indicator'), _('Could not start DNSCrypt UI. Is it installed?'));
         }
     }
 
     destroy() {
-        this._destroyed = true;
-
-        if (this._timerId) {
-            GLib.source_remove(this._timerId);
-            this._timerId = 0;
+        this._cancellable.cancel();
+        this._cancelLatency?.();
+        if (this._latencyTimerId) {
+            GLib.source_remove(this._latencyTimerId);
+            this._latencyTimerId = 0;
         }
-
-        if (this._settingsSignals) {
-            for (const id of this._settingsSignals) {
-                this._settings.disconnect(id);
-            }
-            this._settingsSignals = [];
-        }
-
+        for (const id of this._signalSubs)
+            this._bus.signal_unsubscribe(id);
+        this._signalSubs = [];
+        for (const id of this._settingsSignals)
+            this._settings.disconnect(id);
+        this._settingsSignals = [];
         super.destroy();
     }
 });
