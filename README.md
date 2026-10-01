@@ -1,6 +1,6 @@
 # DNSCrypt Indicator (GNOME Shell Extension)
 
-A top-bar indicator for **`dnscrypt-proxy`** on GNOME 45–50, companion to the **DNSCrypt UI** app.
+A top-bar indicator for **`dnscrypt-proxy`** on GNOME 45–50, companion to the [**DNSCrypt UI**](https://github.com/ajshovon/dnscrypt-ui) app.
 
 ## Features
 
@@ -20,6 +20,8 @@ A top-bar indicator for **`dnscrypt-proxy`** on GNOME 45–50, companion to the 
 ## Install
 
 ```bash
+git clone https://github.com/ajshovon/gnome-dnscrypt-indicator.git
+cd gnome-dnscrypt-indicator
 ./install.sh
 ```
 
@@ -37,3 +39,7 @@ gnome-extensions enable dnscrypt-indicator@local
 - **Latency refresh interval**: 10–600 seconds (only used for the panel latency)
 - **Panel icon style**: shield, server, or lock
 - **Config directory**: where `dnscrypt-proxy.toml` lives (default `/etc/dnscrypt-proxy`)
+
+## License
+
+[GPL-3.0-or-later](LICENSE)
