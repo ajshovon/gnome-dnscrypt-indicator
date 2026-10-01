@@ -2,6 +2,17 @@
 
 A top-bar indicator for **`dnscrypt-proxy`** on GNOME 45–50, companion to the [**DNSCrypt UI**](https://github.com/ajshovon/dnscrypt-ui) app.
 
+<p align="center">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/dnscrypt-indicator-dark.png">
+  <img src="screenshots/dnscrypt-indicator-light.png" alt="DNSCrypt Indicator menu: service status, encrypted DNS switch, upstream latency" width="348">
+</picture>
+  <picture>
+  <source media="(prefers-color-scheme: dark)" srcset="screenshots/dnscrypt-indicator-rules-dark.png">
+  <img src="screenshots/dnscrypt-indicator-rules-light.png" alt="DNSCrypt Indicator menu with the Domain rules submenu expanded" width="348">
+</picture>
+</p>
+
 ## Features
 
 - **Status that means something**: the icon shows whether dnscrypt-proxy is running *and* whether system DNS actually goes through it.

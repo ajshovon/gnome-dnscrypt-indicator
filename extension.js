@@ -388,7 +388,7 @@ class DNSCryptIndicator extends PanelMenu.Button {
                 if (!result.ok && !result.cancelled) {
                     let message = result.message ?? '';
                     if (message.startsWith('Unknown command'))
-                        message = _('The installed DNSCrypt UI helper is out of date. Run install.sh in the dns-crypt-ui folder.');
+                        message = _('The installed DNSCrypt UI helper is out of date. Run install.sh in the dnscrypt-ui folder.');
                     Main.notify(_('Encrypted DNS'), message);
                 }
             } else {
